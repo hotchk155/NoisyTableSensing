@@ -8,61 +8,17 @@
 //////////////////////////////////////////////////////////////
 //////////////////////////////////////////////////////////////
 
+#include "NoisyTableSensing.h"
+#include "HardwareSetup2.h"
+
 //////////////////////////////////////////////////////////////
 //
 // CONSTANTS
 //
 //////////////////////////////////////////////////////////////
 
-// Digital output pins associated with the LED indicators
-// (driven by a pair of 74HC595 shift registers
-#define P_LED_SHIFT  7
-#define P_LED_STORE  6 
-#define P_LED_DATA   5
-
-// Bit masks to denote each of the LEDs in the 
-// 16-bit buffer we output to the shift registers
-#define M_LED_ALL1  0xff00
-#define M_LED_A1    0x8000
-#define M_LED_B1    0x4000
-#define M_LED_C1    0x0400
-#define M_LED_D1    0x0200
-#define M_LED_X1    0x1000
-
-#define M_LED_ALL2  0x00ff
-#define M_LED_A2    0x0004
-#define M_LED_B2    0x0002
-#define M_LED_C2    0x0080
-#define M_LED_D2    0x0040
-#define M_LED_X2    0x0020
-
-// Digital inputs pins from the sensor trigger
-// circuit for first side of the table
-#define P_1A        14
-#define P_1B        15
-#define P_1C        16
-#define P_1D        17
-
-// Digital inputs pins from the sensor trigger
-// circuit for second side of the table
-#define P_2A        10
-#define P_2B        8
-#define P_2C        9
-#define P_2D        11
-
-// Bit masks used in the port registers for
-// reading the sensors
-#define BITMASK_1A  0x08
-#define BITMASK_1B  0x04
-#define BITMASK_1C  0x02
-#define BITMASK_1D  0x01
-#define BITMASK_1ALL (BITMASK_1A|BITMASK_1B|BITMASK_1C|BITMASK_1D)
-
-#define BITMASK_2A  0x04
-#define BITMASK_2B  0x01
-#define BITMASK_2C  0x02
-#define BITMASK_2D  0x08
-#define BITMASK_2ALL (BITMASK_2A|BITMASK_2B|BITMASK_2C|BITMASK_2D)
+#define P_SWITCHP  6
+#define P_SWITCHQ  5
 
 // Timing: Prescalers
 #define TIMER_PRESCALER1 0x04 // 1/256 of Fosc
@@ -77,15 +33,13 @@
 // Timing: How long to ignore input after a read (ms)
 #define IGNORE_MS 300
 
-// Timing: Timeout for a misread (clock ticks)
-#define TIMER_TIMEOUT 200 
+// Timing: Debounce time on buttons
+#define BUTTON_DEBOUNCE_MS 100
 
-// Define the dimension of the table in sensor timing 
-// counts
-#define TABLE_WIDTH_1      180
-#define TABLE_HEIGHT_1     160
-#define TABLE_WIDTH_2      80
-#define TABLE_HEIGHT_2     80
+#define TABLE_WIDTH_1      (int)(WIDTH1*SCALE1)
+#define TABLE_HEIGHT_1     (int)(HEIGHT1*SCALE1)
+#define TABLE_WIDTH_2      (int)(WIDTH2*SCALE2)
+#define TABLE_HEIGHT_2     (int)(HEIGHT2*SCALE2)
 
 // timing states
 enum {
@@ -100,9 +54,6 @@ enum {
 // VARIABLES
 //
 //////////////////////////////////////////////////////////////
-
-// The led buffer  
-unsigned int leds = 0;
 
 // debug mode
 byte debugOutput = 0;
@@ -132,6 +83,10 @@ int intersectCount = 0;
 int intersectX[12];
 int intersectY[12];
 
+unsigned long buttonPdebounce = 0;
+unsigned long buttonQdebounce = 0;
+byte buttonPstate = 0;
+byte buttonQstate = 0;
 
 //////////////////////////////////////////////////////
 // MIDI CHANNEL CLASS
@@ -141,6 +96,7 @@ int intersectY[12];
 // Launchpad note layout
 #define NO_NOTE 255
 #define MIDI_NOTE_MISREAD 127
+#define MIDI_NOTE_BUTTON 126
 class CMidiChannel
 {
   byte m_chan;
@@ -177,6 +133,13 @@ public:
     m_lastNote = MIDI_NOTE_MISREAD;
     midiNote(m_lastNote, 127);
   }  
+  void button()
+  {
+    if(m_lastNote != NO_NOTE)
+      midiNote(m_lastNote, 0);
+    m_lastNote = MIDI_NOTE_BUTTON;
+    midiNote(m_lastNote, 127);
+  }  
 };
 
 CMidiChannel MidiChannel1(0);
@@ -203,7 +166,7 @@ void CalcCircleIntersections(float x0, float y0, float r0, float x1, float y1, f
   // ensure the circles intersect
   if (d > (r0 + r1))
     return ;
-    
+
   // ensure the circles cross
   if (d < fabs(r0 - r1))
     return;
@@ -242,7 +205,7 @@ void CalcCircleIntersections(float x0, float y0, float r0, float x1, float y1, f
 // A---B
 // |   |
 // D---C
-byte CalculatePointFromTOA(int tA, int tB, int tC, int tD, int tableWidth, int tableHeight, int tableDiagonal, int *pX, int *pY )
+unsigned int CalculatePointFromTOA(int tA, int tB, int tC, int tD, int tableWidth, int tableHeight, int tableDiagonal, int *pX, int *pY )
 {  
   // get the minimum value and subtract from all values (typically
   // we expect the minimum value will be zero, but we make sure that
@@ -254,21 +217,21 @@ byte CalculatePointFromTOA(int tA, int tB, int tC, int tD, int tableWidth, int t
   tB -= tmin;
   tC -= tmin;
   tD -= tmin;
-    
+
   // We can visualise tA, tB, tC and tD as the radii of four circles 
   // centered on points A,B,C,D respectively. The smallest circle has 
   // a radius of zero. If we increase the radii of all four circles by 
   // the same amount, L, then there will be a value of L at which the four 
   // circles intersect at the same point. This is the point we need to 
   // calculate. We do this by a fast approximation. 
-  
+
   // The idea is that each pair of circles AB, AC, AD, BC, BD, CD has its 
   // own value of L where those 2 circles just meet. If we work out L for 
   // each of the 6 pairs and take the maximum value we find, then we find 
   // a value of L where all 4 cirles intersect for the first time. It turns
   // out this is a reasonable (and very quick) approximation for the true value
   // of L
-  
+
   // The value for L for each pair of circles is easy to calculate (work out 
   // the distance between the centre points, subtract the 2 radiuses, then 
   // divide the remainder by two)
@@ -287,7 +250,7 @@ byte CalculatePointFromTOA(int tA, int tB, int tC, int tD, int tableWidth, int t
   L_Max = max(L_Max, L_AD);
   L_Max = max(L_Max, L_AC);
   L_Max = max(L_Max, L_DB);
-  
+
   // all important division by 2 only needs to be done once
   L_Max = L_Max / 2;
 
@@ -313,7 +276,7 @@ byte CalculatePointFromTOA(int tA, int tB, int tC, int tD, int tableWidth, int t
   // intersection point that would be derived if the final
   // true value of L was known (i.e. the point of the even
   // triggering our sensors)
-  
+
   // Store the intersection points (2 per pair) for all 
   // six pairs of circles
   intersectCount = 0;	
@@ -324,9 +287,9 @@ byte CalculatePointFromTOA(int tA, int tB, int tC, int tD, int tableWidth, int t
   CalcCircleIntersections(tableWidth,0,tB,0,tableHeight,tD); // B and D
   CalcCircleIntersections(tableWidth,tableHeight,tC,0,tableHeight,tD); // C and D
 
-  // make sure there are intersections before we continue
+    // make sure there are intersections before we continue
   if(!intersectCount)
-    return 0;
+    return RESULT_ERROR;
 
   int i;
   int iAvgX1 = 0;
@@ -366,35 +329,36 @@ byte CalculatePointFromTOA(int tA, int tB, int tC, int tD, int tableWidth, int t
       iAvgY2 += intersectY[i+1];
     }
   }
-  
+
   // Calculation of average
   *pX = iAvgX2 / (intersectCount/2);
   *pY = iAvgY2 / (intersectCount/2);
 
+  unsigned int result = RESULT_READ;
   // disregard negatitve values
-  if(*pX < 0) *pX = 0;
-  if(*pX >= tableWidth) *pX = tableWidth-1;
-  if(*pY < 0) *pY = 0;   
-  if(*pY >= tableHeight) *pY = tableHeight-1;
-  return 1;
+  if(*pX < 0) 
+  {
+    *pX = 0;
+    result |= RESULT_XMIN;
+  }
+  if(*pX >= tableWidth) 
+  {
+    *pX = tableWidth-1;
+    result |= RESULT_XMAX;
+  }
+  if(*pY < 0) 
+  {
+    *pY = 0;   
+    result |= RESULT_YMIN;
+  }
+  if(*pY >= tableHeight) 
+  {
+    *pY = tableHeight-1;
+    result |= RESULT_YMAX;
+  }
+  return result;
 }
 
-//////////////////////////////////////////////////////////////
-// UPDATE LEDS
-// Write out the leds buffer to the shift registers
-void updateLeds()
-{
-  unsigned int m = 0x8000;
-  digitalWrite(P_LED_STORE, LOW);   
-  while(m)
-  {
-    digitalWrite(P_LED_SHIFT, LOW);  
-    digitalWrite(P_LED_DATA, !!(m&leds));  
-    digitalWrite(P_LED_SHIFT, HIGH);      
-    m>>=1;
-  }
-  digitalWrite(P_LED_STORE, HIGH);  
-}
 
 //////////////////////////////////////////////////////
 // DUMP GRID SHOWING CALC LOCATION
@@ -422,11 +386,11 @@ void dump(int x, int y, int width, int height)
 // READ HANDLER FOR PLAYER 1
 // invoked when there is a good read on first side 
 // of the table
-void onRead1()
+void onRead1(unsigned long milliseconds)
 {
   int calcX = 0;  
   int calcY = 0;  
-  byte result = CalculatePointFromTOA(timeOfArrival1A, timeOfArrival1B, timeOfArrival1C, timeOfArrival1D, TABLE_WIDTH_1, TABLE_HEIGHT_1, TABLE_DIAGONAL_1, &calcX, &calcY);
+  unsigned int result = CalculatePointFromTOA(timeOfArrival1A, timeOfArrival1B, timeOfArrival1C, timeOfArrival1D, TABLE_WIDTH_1, TABLE_HEIGHT_1, TABLE_DIAGONAL_1, &calcX, &calcY);
   if(debugOutput)
   {
     Serial.println("***  PLAYER 1 READING ***");
@@ -443,28 +407,30 @@ void onRead1()
     Serial.print(calcY);
     Serial.print(")");
     Serial.println();
-    if(result)
+    if(!!(result & RESULT_ERROR))
     {
-      dump(calcX, calcY, TABLE_WIDTH_1, TABLE_HEIGHT_1);
+      Serial.println("Calculation error!");
     }
     else
     {
-      Serial.println("Calculation error!");
+      dump(calcX, calcY, TABLE_WIDTH_1, TABLE_HEIGHT_1);
     }
   }
   else
   {
-    if(result)
+    if(!!(result & RESULT_ERROR))
+    {
+      MidiChannel1.reading(0, 0);
+      UIReport(UI_BOTTOM, result, 0, 0, milliseconds);
+    }
+    else
     {
       byte row = 8 * ((float)calcY/TABLE_HEIGHT_1);
       byte col = 8 * ((float)calcX/TABLE_WIDTH_1);
       if(row > 7) row=7;
       if(col > 7) col=7;
       MidiChannel1.reading(row, col);
-    }
-    else
-    {
-      MidiChannel1.reading(0, 0);
+      UIReport(UI_BOTTOM, result, row, col, milliseconds);
     }
   }
 }
@@ -473,7 +439,7 @@ void onRead1()
 // MISREAD HANDLER FOR PLAYER 1
 // invoked when there is a misread on first side 
 // of the table
-void onMisread1()
+void onMisread1(unsigned long milliseconds)
 {
   if(debugOutput)
   {
@@ -490,6 +456,12 @@ void onMisread1()
   else
   {
     MidiChannel1.misread();
+    unsigned long result = 0;
+    if(timeOfArrival1A >= 0) result |= RESULT_SENSORA;
+    if(timeOfArrival1B >= 0) result |= RESULT_SENSORB;
+    if(timeOfArrival1C >= 0) result |= RESULT_SENSORC;
+    if(timeOfArrival1D >= 0) result |= RESULT_SENSORD;
+    UIReport(UI_BOTTOM, result|RESULT_MISREAD, 0, 0, milliseconds);    
   }  
 }
 
@@ -497,11 +469,11 @@ void onMisread1()
 // READ HANDLER FOR PLAYER 2
 // invoked when there is a good read on second side 
 // of the table
-void onRead2()
+void onRead2(unsigned long milliseconds)
 {
   int calcX = 0;  
   int calcY = 0;  
-  byte result = CalculatePointFromTOA(timeOfArrival2A, timeOfArrival2B, timeOfArrival2C, timeOfArrival2D, TABLE_WIDTH_2, TABLE_HEIGHT_2, TABLE_DIAGONAL_2, &calcX, &calcY);
+  unsigned int result = CalculatePointFromTOA(timeOfArrival2A, timeOfArrival2B, timeOfArrival2C, timeOfArrival2D, TABLE_WIDTH_2, TABLE_HEIGHT_2, TABLE_DIAGONAL_2, &calcX, &calcY);
   if(debugOutput)
   {
     Serial.println("***  PLAYER 2 READING ***");
@@ -518,29 +490,57 @@ void onRead2()
     Serial.print(calcY);
     Serial.print(")");
     Serial.println();
-    if(result)
+    if(!!(result & RESULT_ERROR))
     {
-      dump(calcX, calcY, TABLE_WIDTH_2, TABLE_HEIGHT_2);
+      Serial.println("Calculation error!");
     }
     else
     {
-      Serial.println("Calculation error!");
+      dump(calcX, calcY, TABLE_WIDTH_2, TABLE_HEIGHT_2);
     }
   }
   else
   {
-    if(result)
+    if(!!(result & RESULT_ERROR))
     {
+      MidiChannel2.reading(0, 0);
+      UIReport(UI_TOP, result, 0, 0, milliseconds);
+    }
+    else
+    {
+      unsigned long uiStatus = 0;
       byte row = 8 * ((float)calcY/TABLE_HEIGHT_2);
       byte col = 8 * ((float)calcX/TABLE_WIDTH_2);
       if(row > 7) row=7;
       if(col > 7) col=7;
       MidiChannel2.reading(row, col);
+      UIReport(UI_TOP, result, row, col, milliseconds);
     }
-    else
-    {
-      MidiChannel2.reading(0, 0);
-    }
+  }
+}
+
+//////////////////////////////////////////////////////
+void onButtonP()
+{
+  if(debugOutput)
+  {
+    Serial.println("*** BUTTON P");
+  }
+  else
+  {
+    MidiChannel2.button();
+  }
+}
+//////////////////////////////////////////////////////
+void onButtonQ()
+{
+  if(debugOutput)
+  {
+    Serial.println("*** BUTTON Q");
+  }
+  else 
+  {
+    MidiChannel1.button();
   }
 }
 
@@ -548,7 +548,7 @@ void onRead2()
 // MISREAD HANDLER FOR PLAYER 2
 // invoked when there is a misread on second side 
 // of the table
-void onMisread2()
+void onMisread2(unsigned long milliseconds)
 {
   if(debugOutput)
   {
@@ -565,6 +565,12 @@ void onMisread2()
   else
   {
     MidiChannel2.misread();
+    unsigned long result = 0;
+    if(timeOfArrival2A >= 0) result |= RESULT_SENSORA;
+    if(timeOfArrival2B >= 0) result |= RESULT_SENSORB;
+    if(timeOfArrival2C >= 0) result |= RESULT_SENSORC;
+    if(timeOfArrival2D >= 0) result |= RESULT_SENSORD;
+    UIReport(UI_TOP, result|RESULT_MISREAD, 0, 0, milliseconds);    
   }  
 }
 
@@ -638,7 +644,7 @@ void setup()
   // calculate the diagonal dimension "contants"
   TABLE_DIAGONAL_1 = hypot(TABLE_WIDTH_1, TABLE_HEIGHT_1);
   TABLE_DIAGONAL_2 = hypot(TABLE_WIDTH_2, TABLE_HEIGHT_2);
-    
+
   // setup the player 1 sensor inputs
   pinMode(P_1A,INPUT);
   pinMode(P_1B,INPUT);
@@ -651,42 +657,18 @@ void setup()
   pinMode(P_2C,INPUT);
   pinMode(P_2D,INPUT);
 
-  // shift register
-  pinMode(P_LED_SHIFT, OUTPUT);
-  pinMode(P_LED_STORE, OUTPUT);
-  pinMode(P_LED_DATA, OUTPUT);
+  pinMode(P_SWITCHP,INPUT);  
+  pinMode(P_SWITCHQ,INPUT);
   
-  unsigned int initAnim[] = {
-    M_LED_A1,
-    M_LED_B1,
-    M_LED_A2,
-    M_LED_B2,
-    M_LED_C2,
-    M_LED_D2,
-    M_LED_C1,
-    M_LED_D1,
-    M_LED_X1,
-    M_LED_X2,
-    0
-  };
-  for(int i=0; i<3; ++i)
-  {
-    unsigned int *pos = initAnim;
-    for(;;)
-    {
-      leds = *pos;
-      updateLeds();
-      if(!*pos)
-        break;
-      delay(40);
-      ++pos;
-    }
-  }
-  
+  digitalWrite(P_SWITCHP,HIGH);  
+  digitalWrite(P_SWITCHQ,HIGH);
+
+  UISetup();
+
   PCMSK0 = 0;  
   PCMSK1 = 0;  
   PCICR |= (1<<PCIE0) | (1<<PCIE1);
-      
+
   if(debugOutput)
   {
     Serial.begin(9600);
@@ -701,6 +683,8 @@ void setup()
   interrupts();
   state1 = TIMING_START;   
   state2 = TIMING_START;   
+
+
 }
 
 //////////////////////////////////////////////////////
@@ -725,72 +709,51 @@ void loop()
     ///////////////////////////////////////////////
     // FOLLOWING A READ EVENT, IGNORE ALL INPUT FOR 
     // A PERIOD OF TIME
-    case TIMING_IGNORE: 
-      PCMSK1 = 0;  
-      if(milliseconds < timeout1)
-        break;
-      // otherwise fall thru
-      
+  case TIMING_IGNORE: 
+    PCMSK1 = 0;  
+    if(milliseconds < timeout1)
+      break;
+    // otherwise fall thru
+
     /////////////////////////////////////////
     // READY TO START LISTING FOR A NEW EVENT
-    case TIMING_START: 
-      TCNT1 = 0;
-      TCCR1A = 0;
-      TCCR1B = 0;  
-      timeOfArrival1A = -1;
-      timeOfArrival1B = -1;
-      timeOfArrival1C = -1;
-      timeOfArrival1D = -1;
-      PCMSK1 = BITMASK_1ALL;
-      state1 = TIMING_LISTEN;
-      break;
-      
+  case TIMING_START: 
+    TCNT1 = 0;
+    TCCR1A = 0;
+    TCCR1B = 0;  
+    timeOfArrival1A = -1;
+    timeOfArrival1B = -1;
+    timeOfArrival1C = -1;
+    timeOfArrival1D = -1;
+    PCMSK1 = BITMASK_1ALL;
+    state1 = TIMING_LISTEN;
+    break;
+
     /////////////////////////////////////////
     // LISTENING FOR THE START OF A NEW EVENT 
-    case TIMING_LISTEN:
-      if((PCMSK1 & BITMASK_1ALL) != BITMASK_1ALL)
-        state1 = TIMING_RUN;
-      break;
-      
+  case TIMING_LISTEN:
+    if((PCMSK1 & BITMASK_1ALL) != BITMASK_1ALL)
+      state1 = TIMING_RUN;
+    break;
+
     ////////////////////////////////////
     // LISTENING FOR COMPLETION OF EVENT 
-    case TIMING_RUN:
-      if(!(PCMSK1 & BITMASK_1ALL))
-      {
-        onRead1();        
-        state1 = TIMING_IGNORE;
-        timeout1 = milliseconds + IGNORE_MS;
-        leds &= ~M_LED_ALL1;
-        leds |= M_LED_A1|M_LED_B1|M_LED_C1|M_LED_D1;
-        updateLeds();
-        clearLeds1 = milliseconds + READ_LED_MS;
-      }
-      else if(TCNT1 > TIMER_TIMEOUT)
-      {
-        onMisread1();
-        state1 = TIMING_IGNORE;
-        timeout1 = milliseconds + IGNORE_MS;
-        leds &= ~M_LED_ALL1;
-        leds |= M_LED_X1;
-        leds |= (timeOfArrival1A >= 0)? M_LED_A1: 0;
-        leds |= (timeOfArrival1B >= 0)? M_LED_B1: 0;
-        leds |= (timeOfArrival1C >= 0)? M_LED_C1: 0;
-        leds |= (timeOfArrival1D >= 0)? M_LED_D1: 0;
-        updateLeds();
-        clearLeds1 = milliseconds + MISREAD_LED_MS;
-      }
-      break;      
+  case TIMING_RUN:
+    if(!(PCMSK1 & BITMASK_1ALL))
+    {
+      onRead1(milliseconds);        
+      state1 = TIMING_IGNORE;
+      timeout1 = milliseconds + IGNORE_MS;
+    }
+    else if(TCNT1 > TIMER_TIMEOUT1)
+    {
+      onMisread1(milliseconds);
+      state1 = TIMING_IGNORE;
+      timeout1 = milliseconds + IGNORE_MS;
+    }
+    break;      
   }
-  
-  ///////////////////////////////////////////////
-  // PLAYER 1 LEDS
-  if(clearLeds1 && milliseconds > clearLeds1)
-  {
-    leds &= ~M_LED_ALL1;
-    updateLeds();
-    clearLeds1 = 0;
-  }  
-   
+
   ///////////////////////////////////////////////
   //
   //
@@ -803,73 +766,88 @@ void loop()
     ///////////////////////////////////////////////
     // FOLLOWING A READ EVENT, IGNORE ALL INPUT FOR 
     // A PERIOD OF TIME
-    case TIMING_IGNORE: 
-      PCMSK0 = 0;  
-      if(milliseconds < timeout2)
-        break;
-      // otherwise fall thru
-      
+  case TIMING_IGNORE: 
+    PCMSK0 = 0;  
+    if(milliseconds < timeout2)
+      break;
+    // otherwise fall thru
+
     /////////////////////////////////////////
     // READY TO START LISTING FOR A NEW EVENT
-    case TIMING_START: 
-      TCNT2 = 0;
-      TCCR2A = 0;
-      TCCR2B = 0;  
-      timeOfArrival2A = -1;
-      timeOfArrival2B = -1;
-      timeOfArrival2C = -1;
-      timeOfArrival2D = -1;
-      PCMSK0 = BITMASK_2ALL;
-      state2 = TIMING_LISTEN;
-      break;
-      
+  case TIMING_START: 
+    TCNT2 = 0;
+    TCCR2A = 0;
+    TCCR2B = 0;  
+    timeOfArrival2A = -1;
+    timeOfArrival2B = -1;
+    timeOfArrival2C = -1;
+    timeOfArrival2D = -1;
+    PCMSK0 = BITMASK_2ALL;
+    state2 = TIMING_LISTEN;
+    break;
+
     /////////////////////////////////////////
     // LISTENING FOR THE START OF A NEW EVENT 
-    case TIMING_LISTEN:
-      if((PCMSK0 & BITMASK_2ALL) != BITMASK_2ALL)
-        state2 = TIMING_RUN;
-      break;
-      
+  case TIMING_LISTEN:
+    if((PCMSK0 & BITMASK_2ALL) != BITMASK_2ALL)
+      state2 = TIMING_RUN;
+    break;
+
     ////////////////////////////////////
     // LISTENING FOR COMPLETION OF EVENT 
-    case TIMING_RUN:
-      if(!(PCMSK0 & BITMASK_2ALL))
-      {
-        onRead2();        
-        state2 = TIMING_IGNORE;
-        timeout2 = milliseconds + IGNORE_MS;
-        leds &= ~M_LED_ALL2;
-        leds |= M_LED_A2|M_LED_B2|M_LED_C2|M_LED_D2;
-        updateLeds();
-        clearLeds2 = milliseconds + READ_LED_MS;
-      }
-      else if(TCNT2 > TIMER_TIMEOUT)
-      {
-        onMisread2();
-        state2 = TIMING_IGNORE;
-        timeout2 = milliseconds + IGNORE_MS;
-        leds &= ~M_LED_ALL2;
-        leds |= M_LED_X2;
-        leds |= (timeOfArrival2A >= 0)? M_LED_A2: 0;
-        leds |= (timeOfArrival2B >= 0)? M_LED_B2: 0;
-        leds |= (timeOfArrival2C >= 0)? M_LED_C2: 0;
-        leds |= (timeOfArrival2D >= 0)? M_LED_D2: 0;
-        updateLeds();
-        clearLeds2 = milliseconds + MISREAD_LED_MS;
-      }
-      break;      
+  case TIMING_RUN:
+    if(!(PCMSK0 & BITMASK_2ALL))
+    {
+      onRead2(milliseconds);        
+      state2 = TIMING_IGNORE;
+      timeout2 = milliseconds + IGNORE_MS;
+    }
+    else if(TCNT2 > TIMER_TIMEOUT2)
+    {
+      onMisread2(milliseconds);
+      state2 = TIMING_IGNORE;
+      timeout2 = milliseconds + IGNORE_MS;
+    }
+    break;      
   }
-  
-  ///////////////////////////////////////////////
-  // PLAYER 2 LEDS
-  if(clearLeds2 && milliseconds > clearLeds2)
+
+  // reading the switches
+  if(milliseconds > buttonPdebounce)
   {
-    leds &= ~M_LED_ALL2;
-    updateLeds();
-    clearLeds2 = 0;
-  }  
+    if(!digitalRead(P_SWITCHP))
+    {
+      if(!buttonPstate) {
+        onButtonP();
+        buttonPdebounce = milliseconds + BUTTON_DEBOUNCE_MS;
+        buttonPstate = 1;
+      }
+    }
+    else 
+    {
+      buttonPstate = 0;
+    }
+  }
+  if(milliseconds > buttonQdebounce)
+  {
+    if(!digitalRead(P_SWITCHQ))
+    {
+      if(!buttonQstate) {
+        onButtonQ();
+        buttonQdebounce = milliseconds + BUTTON_DEBOUNCE_MS;
+        buttonQstate = 1;
+      }
+    }
+    else 
+    {
+      buttonQstate = 0;
+    }
+  }
+
+  // maintain LEDs
+  UIRun(milliseconds);  
 }
-      
+
 //
 // EOF
 //
+
