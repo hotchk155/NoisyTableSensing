@@ -15,7 +15,7 @@
 #include "Arduino.h"
 #include "NoisyTableSensing.h"
 
-#if 0
+#ifdef FULL_IU
 
 #define P_HEARTBEAT 13
 #define P_DIN 4

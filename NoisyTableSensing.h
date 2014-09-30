@@ -15,6 +15,8 @@ typedef unsigned char byte;
 #define UI_TOP 0
 #define UI_BOTTOM 1
 
+// comment out to use minimal UI
+#define FULL_IU 1
 
 void UISetup();
 void UIReport(byte which, unsigned int result, byte row, byte col, unsigned long milliseconds);

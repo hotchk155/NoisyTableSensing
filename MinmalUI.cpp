@@ -1,6 +1,9 @@
 #include "Arduino.h"
 #include "NoisyTableSensing.h"
 
+
+#ifndef FULL_IU
+
 #define P_HEARTBEAT 13
 #define P_SHCLK 4
 #define P_STCLK 3
@@ -125,3 +128,5 @@ void UIRun(unsigned long milliseconds) {
     UIRefresh();  
   }
 }
+
+#endif // FULL_IU
